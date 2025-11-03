@@ -183,8 +183,8 @@ spec, freqs = spectrogram_superlets(y, sampling_frequency=1000,
                                     frequencies=(1, 350, 200), 
                                     first_cycle=5, 
                                     order_range=(3, 20))
-noise = Gaussian_white_noise(size_of_the_spec=spec.shape, variance=0.01)
-zeros = detection_of_the_zeros(np.abs(spec+noise), size=10, threshold=1e-6)
+noise = Gaussian_white_noise(size_of_the_spec=spec.shape, variance=0.001)
+zeros = detection_of_the_zeros(np.abs(spec+noise), size=5, threshold=1e-6)
 
 # Triangulation de Delaunay
 tri, points = Delaunay_tessellation(zeros, t, freqs)
