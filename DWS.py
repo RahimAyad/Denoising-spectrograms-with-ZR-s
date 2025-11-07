@@ -210,41 +210,114 @@ def detect_zeros(spectrograms: np.ndarray,
 # ============================================================================
 
  
-def generate_multiple_noise_realization(spec: np.ndarray, 
-                                             J: int = 256,
-                                             beta: float = 1.0) -> tuple:
+def generate_multiple_noise_realization_optimized(
+    spec: np.ndarray,  # (1000, 60000)
+    J: int = 50,
+    beta: float = 1.0,
+    batch_size: int = None,  # Auto-détection si None
+    verbose: bool = True
+) -> tuple:
     """
-    Génère J réalisations de bruit sur le spectrogramme.
+    Version optimisée pour grands spectrogrammes.
+    Auto-détecte le batch_size optimal si non fourni.
     """
     
-    # Estimation gamma_0 (inchangé)
+    if verbose:
+        print("\n" + "="*70)
+        print("OPTIMIZED NOISE REALIZATION GENERATOR")
+        print("="*70)
+    
+    # Auto-détection du batch_size optimal
+    if batch_size is None:
+        import psutil
+        available_ram_gb = psutil.virtual_memory().available / (1024**3)
+        
+        bytes_per_real = spec.size * 16  # complex128
+        mb_per_real = bytes_per_real / (1024**2)
+        
+        # Utiliser 35% de la RAM disponible pour être safe
+        safe_ram_gb = available_ram_gb * 0.3
+        batch_size = max(1, int((safe_ram_gb * 1024) / mb_per_real))
+        
+        if verbose:
+            print(f"  Available RAM: {available_ram_gb:.1f} GB")
+            print(f"  Memory per realization: {mb_per_real:.1f} MB")
+            print(f"  Auto-selected batch_size: {batch_size}")
+    
+    # Estimation gamma
     magnitude = np.abs(spec)
-    sorted_magnitude = np.sort(magnitude.flatten())  # ⚠️ Fix: flatten() pas flatted()
+    sorted_magnitude = np.sort(magnitude.flatten())
     gamma_0 = np.median(sorted_magnitude[:len(sorted_magnitude)//10])
     gamma_j = beta * gamma_0
-
-    print(f' Estimated gamma_0: {gamma_0:.6f}')
-    print(f' gamma_j: {gamma_j}, gamma_0: {gamma_0}, beta: {beta}')
-    print(f' Number of realizations (J): {J}')
-
-    # 🚀 VECTORISATION: Générer TOUS les bruits d'un coup
-    # Shape: (J, *spec.shape) au lieu de boucle
-    noise_real = np.random.normal(0, gamma_j, (J, *spec.shape))
-    noise_img = np.random.normal(0, gamma_j, (J, *spec.shape))
-    noise = noise_real + 1j * noise_img
     
-    # Broadcasting: spec (F, T) → (1, F, T) pour additionner avec (J, F, T)
-    noisy_specs = spec[np.newaxis, :, :] + noise  # Shape: (J, F, T)
+    if verbose:
+        print(f"\n  Spectrogram shape: {spec.shape}")
+        print(f"  Total realizations (J): {J}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Number of batches: {int(np.ceil(J / batch_size))}")
+        print(f"  gamma_j: {gamma_j:.6f}")
     
-    # 🚀 VECTORISATION: detect_zeros sur toutes les réalisations
-    # (dépend de ta fonction detect_zeros, voir ci-dessous)
-    all_zeros_masks = detect_zeros(noisy_specs, threshold_percentile=5)
+    # Pré-allocation du résultat final (seulement les masques booléens = léger)
+    all_zeros_masks = np.zeros((J, *spec.shape), dtype=bool)
     
-    # Stats
-    total_zeros = np.sum(all_zeros_masks)  # Somme directe sur tout le tableau
-    print(f" Total zeros across all realizations: {total_zeros}")
-    print(f" Average zeros per realization: {total_zeros/J:.1f}")
-
+    # Traitement par batch
+    n_batches = int(np.ceil(J / batch_size))
+    
+    import time
+    start_time = time.time()
+    
+    for batch_idx in range(n_batches):
+        batch_start_time = time.time()
+        
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, J)
+        current_batch_size = end_idx - start_idx
+        
+        if verbose:
+            print(f"\n  Batch {batch_idx+1}/{n_batches} "
+                  f"[realizations {start_idx}→{end_idx-1}]", end='')
+        
+        # 1. Générer le bruit (seulement pour ce batch)
+        noise_real = np.random.normal(0, gamma_j, (current_batch_size, *spec.shape))
+        noise_imag = np.random.normal(0, gamma_j, (current_batch_size, *spec.shape))
+        noise = noise_real + 1j * noise_imag
+        
+        # Libération immédiate
+        del noise_real, noise_imag
+        
+        # 2. Ajouter le bruit au spectrogramme original
+        noisy_specs_batch = spec[np.newaxis, :, :] + noise
+        del noise
+        
+        # 3. Détecter les zeros pour ce batch
+        zeros_batch = detect_zeros(
+            noisy_specs_batch,
+            threshold_percentile=5,
+            verbose=False
+        )
+        del noisy_specs_batch
+        
+        # 4. Stocker dans le résultat final
+        all_zeros_masks[start_idx:end_idx] = zeros_batch
+        del zeros_batch
+        
+        if verbose:
+            batch_time = time.time() - batch_start_time
+            print(f" ✓ ({batch_time:.2f}s)")
+    
+    total_time = time.time() - start_time
+    
+    if verbose:
+        # Statistiques finales
+        total_zeros = np.sum(all_zeros_masks)
+        print(f"\n  {'─'*66}")
+        print(f"  Total processing time: {total_time:.2f}s")
+        print(f"  Average time per batch: {total_time/n_batches:.2f}s")
+        print(f"  Total zeros detected: {total_zeros:,}")
+        print(f"  Average zeros per realization: {total_zeros/J:.1f}")
+        print(f"  Zeros density: {100*total_zeros/all_zeros_masks.size:.3f}%")
+        print("="*70 + "\n")
+    
     return all_zeros_masks, gamma_j
 
 # ============================================================================
@@ -347,108 +420,180 @@ def assign_zeros_to_grid(all_zeros: np.ndarray,
 # ============================================================================
 # Caculate the area of the zeros occupying each cell of the grid
 # ============================================================================
-
-def compute_bin_areas (all_zeros: np.ndarray,
-                        t_bounds : Tuple[float,float],
-                        f_bounds : Tuple[float,float],
-                        n_bins : Tuple[int,int],
-                        method : str = 'convex_hull')-> np.ndarray:
-    
+def compute_bin_areas_optimized(
+    all_zeros: np.ndarray,
+    t_bounds: Tuple[float, float],
+    f_bounds: Tuple[float, float],
+    n_bins: Tuple[int, int],
+    method: str = 'convex_hull',
+    batch_size_j: int = 5,  # Traiter J réalisations par batch
+    max_points_per_hull: int = 10000,  # Limite pour ConvexHull
+    verbose: bool = True
+) -> np.ndarray:
     """
-    Compute the area of the zeros present in each bin of the grid with two methods
-    Convex hulls or pixel counts, the convex hull, follows the paper and is also
-    giving a real geometric estimatin, but it can lake of precision like over estimating
-    the area specially when the dots are distributed in samll areas with a low resolution
-    and it is also slower than just counting pixels, to get a sort of density.
-
-    Args: 
-        all_zeros: Shape (J, F, T) booleans mask,
-        t_bounds : (t_min, t_max),
-        f_bounds : (f_min, f_max),
-        n_bins : (n_bins_t, n_bins_f),
-        method : 'convex_hull', 'pixel_count'
-
-    returns: 
-        areas: Shape (n_bins_f, n_bins_t) - area normalized [0,1] per bin
-    """
-
-    print("\n" + "="*70)
-    print(f"Computing bin areas (method: {method})")
-    print("="*70)
+    Version optimisée qui traite les réalisations par batch.
     
-    # 1 Extract the zeros and assing parameters
-    j_coords, f_coords, t_coords =  np.where(all_zeros)
-
+    Args:
+        all_zeros: Shape (J, F, T) masques booléens
+        t_bounds: (t_min, t_max)
+        f_bounds: (f_min, f_max)
+        n_bins: (n_bins_t, n_bins_f)
+        method: 'convex_hull' ou 'pixel_count'
+        batch_size_j: Nombre de réalisations traitées simultanément
+        max_points_per_hull: Limite de points pour ConvexHull (sous-échantillonnage au-delà)
+        verbose: Afficher les progrès
+    
+    Returns:
+        areas: Shape (n_bins_f, n_bins_t) - aire normalisée [0,1] par bin
+    """
+    
+    if verbose:
+        print("\n" + "="*70)
+        print(f"Computing bin areas (method: {method})")
+        print("="*70)
+    
+    # Paramètres
     J, n_freqs, n_times = all_zeros.shape
-    t_min, t_max =  t_bounds
-    f_min, f_max =  f_bounds
-    n_bins_t, n_bins_f =  n_bins
-
-    # 2 Converstion to physical values 
-    t_values = t_min + (t_max - t_min) * t_coords / (n_times - 1)
-    f_values = f_min + (f_max - f_min) * f_coords / (n_freqs - 1)
+    t_min, t_max = t_bounds
+    f_min, f_max = f_bounds
+    n_bins_t, n_bins_f = n_bins
     
-    # 3 Assign to the bins
-    t_edges = np.linspace(t_min, t_max, n_bins_t+1)
-    f_edges = np.linspace(f_min, f_max, n_bins_f+1)
-
-    t_idx = np.clip(np.digitize(t_values, t_edges) - 1, 0, n_bins_t - 1)
-    f_idx = np.clip(np.digitize(f_values, f_edges) - 1 , 0, n_bins_f - 1)
-
-    # np.digitize counts literally the number of elements inside of intervales (boxes),
-    # the first -1 is just to get rid of the zero-based logic of python 
-    # np.clip is just for security and make sure that the borders are not making any problem
-
-    # 4 Regroupment of the points per bin 
-    from collections import defaultdict
-    bin_points = defaultdict(list)
-
-    for i in range(len(t_idx)):
-        bin_key = (f_idx[i], t_idx[i])
-        bin_points[bin_key].append([t_values[i], f_values[i]])
-
-
-    # 5 Compute area per bins
-    areas = np.zeros((n_bins_f, n_bins_t), dtype=np.float32)
-
-    # length of one bin (for normalization)
-    bin_width_t  = (t_max - t_min) / n_bins_t
+    if verbose:
+        print(f"  Input shape: {all_zeros.shape}")
+        print(f"  Grid: {n_bins_f} × {n_bins_t} bins")
+        print(f"  Processing in batches of {batch_size_j} realizations")
+    
+    # Pré-calcul des edges (une seule fois)
+    t_edges = np.linspace(t_min, t_max, n_bins_t + 1)
+    f_edges = np.linspace(f_min, f_max, n_bins_f + 1)
+    
+    bin_width_t = (t_max - t_min) / n_bins_t
     bin_width_f = (f_max - f_min) / n_bins_f
     bin_area_max = bin_width_t * bin_width_f
-
-    for (f_bin, t_bin), points in bin_points.items():
-        points = np.array(points)
+    
+    # Accumulateurs pour les aires de tous les batchs
+    areas_accumulator = np.zeros((n_bins_f, n_bins_t), dtype=np.float32)
+    counts_accumulator = np.zeros((n_bins_f, n_bins_t), dtype=np.int32)
+    
+    # Traitement par batch de J
+    n_batches = int(np.ceil(J / batch_size_j))
+    
+    import time
+    start_time = time.time()
+    
+    for batch_idx in range(n_batches):
+        batch_start = time.time()
         
-        if len(points) < 3:
-            # Moins de 3 points → aire = 0
-            areas[f_bin, t_bin] = 0.0
+        start_j = batch_idx * batch_size_j
+        end_j = min((batch_idx + 1) * batch_size_j, J)
+        
+        if verbose:
+            print(f"\n  Batch {batch_idx+1}/{n_batches} [J={start_j}→{end_j-1}]", end='')
+        
+        # Extraire seulement ce batch
+        batch_zeros = all_zeros[start_j:end_j]
+        
+        # 1. Extraction des coordonnées (seulement pour ce batch)
+        j_coords, f_coords, t_coords = np.where(batch_zeros)
+        n_zeros = len(j_coords)
+        
+        if n_zeros == 0:
+            if verbose:
+                print(" → No zeros, skipped")
             continue
         
-        if method == 'convex_hull':
-            try:
-                hull = ConvexHull(points)
-                area = hull.volume  # En 2D, 'volume' = aire
-            except:
-                # Points colinéaires ou autre erreur
-                area = 0.0
+        # 2. Conversion en coordonnées physiques
+        t_values = t_min + (t_max - t_min) * t_coords / (n_times - 1)
+        f_values = f_min + (f_max - f_min) * f_coords / (n_freqs - 1)
         
-        elif method == 'pixel_count':
-            # Aire = nombre de points uniques * résolution moyenne
-            unique_points = np.unique(points, axis=0)
-            # Estimation grossière : chaque point = 1 pixel
-            area = len(unique_points) * (bin_area_max / 100)  # Ajuste selon résolution
+        # 3. Assignment aux bins (vectorisé)
+        t_idx = np.clip(np.searchsorted(t_edges[1:], t_values), 0, n_bins_t - 1)
+        f_idx = np.clip(np.searchsorted(f_edges[1:], f_values), 0, n_bins_f - 1)
         
-        else :  
-            raise ValueError(f"Unknow method: {method}, please enter convex_hull or pixel_count")
+        # 4. Regroupement efficace avec numpy
+        # Créer des clés uniques pour chaque bin
+        bin_keys = f_idx * n_bins_t + t_idx
         
-        # Normalization : relative area according to the bins
-        areas[f_bin, t_bin] = min(area / bin_area_max, 1.0)
+        # Trier pour regrouper les points du même bin
+        sort_indices = np.argsort(bin_keys)
+        sorted_keys = bin_keys[sort_indices]
+        sorted_t = t_values[sort_indices]
+        sorted_f = f_values[sort_indices]
+        
+        # Trouver les frontières de chaque bin
+        unique_keys, split_indices = np.unique(sorted_keys, return_index=True)
+        split_indices = np.append(split_indices, len(sorted_keys))
+        
+        # 5. Calculer l'aire pour chaque bin non-vide
+        n_bins_with_data = len(unique_keys)
+        
+        for i in range(n_bins_with_data):
+            # Récupérer les indices du bin actuel
+            start = split_indices[i]
+            end = split_indices[i + 1]
+            
+            # Points de ce bin
+            bin_t = sorted_t[start:end]
+            bin_f = sorted_f[start:end]
+            points = np.column_stack([bin_t, bin_f])
+            
+            # Retrouver les indices (f_bin, t_bin)
+            bin_key = unique_keys[i]
+            f_bin = int(bin_key // n_bins_t)
+            t_bin = int(bin_key % n_bins_t)
+            
+            if len(points) < 3:
+                continue
+            
+            # Calcul de l'aire selon la méthode
+            if method == 'convex_hull':
+                # Sous-échantillonnage si trop de points
+                if len(points) > max_points_per_hull:
+                    indices = np.random.choice(len(points), max_points_per_hull, replace=False)
+                    points = points[indices]
+                
+                try:
+                    hull = ConvexHull(points)
+                    area = hull.volume  # En 2D = aire
+                except:
+                    area = 0.0
+            
+            elif method == 'pixel_count':
+                # Estimation par densité
+                unique_points = np.unique(points, axis=0)
+                area = len(unique_points) * (bin_area_max / 100)
+            
+            else:
+                raise ValueError(f"Unknown method: {method}")
+            
+            # Normalisation
+            normalized_area = min(area / bin_area_max, 1.0)
+            
+            # Accumulation (moyenne progressive)
+            areas_accumulator[f_bin, t_bin] += normalized_area
+            counts_accumulator[f_bin, t_bin] += 1
+        
+        if verbose:
+            batch_time = time.time() - batch_start
+            print(f" → {n_zeros:,} zeros, {n_bins_with_data} bins ({batch_time:.2f}s)")
     
-    print(f"Max area ratio: {areas.max():.3f}")
-    print(f"Mean area ratio: {areas.mean():.3f}")
-    print(f"Bins with area > 0: {np.sum(areas > 0)}")
+    # 6. Moyenner les aires sur tous les batchs
+    mask = counts_accumulator > 0
+    areas = np.zeros_like(areas_accumulator)
+    areas[mask] = areas_accumulator[mask] / counts_accumulator[mask]
+    
+    total_time = time.time() - start_time
+    
+    if verbose:
+        print(f"\n  {'─'*66}")
+        print(f"  Total time: {total_time:.2f}s")
+        print(f"  Max area ratio: {areas.max():.3f}")
+        print(f"  Mean area ratio: {areas.mean():.3f}")
+        print(f"  Bins with area > 0: {np.sum(areas > 0)}/{n_bins_f * n_bins_t}")
+        print("="*70 + "\n")
     
     return areas
+
 
 
 # ============================================================================
@@ -711,7 +856,7 @@ def main():
     print(f"Grid Definition: {n_bins[0]}×{n_bins[1]} bins")
     print("="*70)
     
-    areas = compute_bin_areas(
+    areas = compute_bin_areas_optimized(
         all_zeros=all_zeros,
         t_bounds=t_bounds,
         f_bounds=f_bounds,
